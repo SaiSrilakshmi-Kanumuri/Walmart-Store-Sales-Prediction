@@ -1,0 +1,385 @@
+---
+title: "Walmart Sales Prediction"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading, results="hide"}
+#Walmart Predictive Analysis
+#Load Required Libraries
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(readr)
+library(lubridate)
+library(rpart)
+library(rattle)
+library(car)
+library(caret)
+library(corrplot)
+library(rpart.plot)
+```
+Ensure that you have train.csv, test.csv, stores.csv and features.csv in your current
+working directory.  
+```{r}
+#Loading files to work with
+setwd("E:/NEU DOCS/Data Mining/Project")
+train <- read.csv('E:/NEU DOCS/Data Mining/Project/train.csv')
+stores <- read.csv("E:/NEU DOCS/Data Mining/Project/stores.csv")
+features <- read.csv("E:/NEU DOCS/Data Mining/Project/features.csv")
+# train <- read.csv("/Users/akhilakanumuri/Downloads/walmart-recruiting-store-sales-forecasting/train.csv")
+# stores <- read.csv("/Users/akhilakanumuri/Downloads/walmart-recruiting-store-sales-forecasting/stores.csv")
+# features <- read.csv("/Users/akhilakanumuri/Downloads/walmart-recruiting-store-sales-forecasting/features.csv")
+```
+Our first step will be to join our two tables by Store which is the common column.  
+```{r}
+stores$Store <- factor(stores$Store)
+train$Store <- factor(train$Store)
+train <- full_join(train,stores,by=c("Store"))
+```
+#Preparation
+In this step of the process we will conduct some feature engineering, we will use the
+features that our data currently has but will tweak them in a way that makes our analysis easier. The most important objective in this step is to generate new features that will help us produce a better model 
+**Include a Week Number of the year**
+```{r}
+train$WeekNum <- lubridate::week(train$Date)
+```
+We have also noticed that some Weekly Sales contain negative values, after analyzing the data we have concluded that those refer to Returned Products from previous weeks.
+**Add a Returns Column**
+```{r}
+train$Returns <- lapply(train$Weekly_Sales,function(sales){
+  ifelse(sales < 0,sales,0)
+})
+train$Weekly_Sales <- lapply(train$Weekly_Sales,function(sales){
+  ifelse(sales > 0,sales,0)
+})
+```
+
+At the moment, our data frame contains 421570 observations, since the objective of this model is to predict the Weekly Sales of a particular store given previous years, external information and tendency we will add the sales per department and put it together into one observation. In other words we will not subdivide sales by department. Thus we can make our Weekly Sales to be our Net Sales since we now can do Weekly_Sales - Returns to avoid negative values.   
+##Aggregating Weekly Sales to Net Sales
+```{r, eval=FALSE}
+final_data <- data.frame(Store=factor(),Size = numeric(), Date=as.Date(character()),Weekly_Sales=numeric(),IsHoliday=logical(),Type=factor(),WeekNum=factor())
+aggregate_sales <- function(){
+for(i in 1:45){
+  store_data <- train %>% filter(Store == i)
+  dates <- unique(train$Date)
+  for(next_date in seq_along(dates)){
+    current_date <- unique(train$Date)[[next_date]]
+    date_data <- store_data %>% filter(Date==current_date)
+    #Add all the weekly sales
+    net_sales <- sum(unlist(date_data$Weekly_Sales)) - sum(unlist(date_data$Returns))
+    #Construct the data frame and append it
+    next_row <- data.frame(Store=i,Date=current_date,Weekly_Sales=net_sales,IsHoliday=date_data$IsHoliday[[1]],Type=date_data$Type[[1]],WeekNum=date_data$WeekNum[[1]],Size=date_data$Size[[1]])
+    next_row$Store <- factor(next_row$Store)
+    final_data <- rbind(final_data,next_row)
+  }
+  }
+return(final_data)
+}
+##Sum the sales by store without taking into account each department
+final_data <- aggregate_sales()
+```
+
+```{r, echo=FALSE}
+train <- read_csv("E:/NEU DOCS/Data Mining/Project/merged3.csv")
+# train <- read_csv("/Users/akhilakanumuri/Downloads/merged3.csv")
+train$Weekly_Sales <- as.numeric(train$Weekly_Sales)
+train$Store <- factor(train$Store)
+train$Type <- factor(train$Type)
+head(train)
+```
+After performing this procedure we now have 6435 observations which makes our data more manageable for further analysis.  
+```{r}
+features$Store <- factor(features$Store)
+features$Date <- as.Date(features$Date)
+train$Date <- as.Date(train$Date)
+#Merge our final_data with our features
+train <- left_join(train,features,by=c("Store","Date","IsHoliday"))
+
+# Make the NA markdown as 0
+train$MarkDown1 <- sapply(train$MarkDown1, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$MarkDown2 <- sapply(train$MarkDown2, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$MarkDown3 <- sapply(train$MarkDown3, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$MarkDown4 <- sapply(train$MarkDown4, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$MarkDown5 <- sapply(train$MarkDown5, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$CPI <- sapply(train$CPI, function(value){
+  ifelse(is.na(value),0,value)
+})
+train$Unemployment <- sapply(train$Unemployment, function(value){
+  ifelse(is.na(value),0,value)
+})
+```
+
+
+**Rank**
+  We will also add a feature called rank, which is getting the range of values of Weekly Sales.
+We will make five Range Buckets namely A,B,C,D and E. We will also try to predict in which of this buckets a given store would lie in a given week. 
+
+```{r,echo=FALSE}
+#Range Weekly Sales: Divide our sales into five different groups
+range_sales <- range(train$Weekly_Sales)
+range <- (range_sales[[2]] - range_sales[[1]]) / 5
+first <- c(range_sales[[1]], range_sales[[1]] + range)
+second <- c(range_sales[[1]] + range, range_sales[[1]] + 2*range)
+third <-c(range_sales[[1]] + 2*range, range_sales[[1]] + 3*range)
+fourth <- c(range_sales[[1]] + 3*range, range_sales[[1]] + 4*range)
+fifth <- c(range_sales[[1]] + 4*range, range_sales[[2]])
+train$Rank <- sapply(train$Weekly_Sales, function(sales){
+  if(sales >= first[[1]] &  sales <= first[[2]]){
+    return('A')
+  }
+  else if(sales >= second[[1]] & sales <= second[[2]]){
+    return('B')
+  }
+  else if(sales >= third[[1]] & sales <= third[[2]]){
+    return('C')
+  }
+  else if(sales >= fourth[[1]] & sales <= fourth[[2]]){
+    return('D')
+  }
+  else{
+    return('E')
+  }
+})
+train$Rank <- factor(train$Rank)
+```
+We will partition the training set into two different data frames in order to keep
+our analysis consistent and avoid testing on our training data.
+
+#Explortory Analysis
+###Data Review  
+For a small glimpse of how our data looks like we can refer to the following picture.  
+```{r}
+head(train)
+```
+For our exploration analysis we started with the aggregate() function because we wanted to 
+know which Store and Type of store was having the most sales, on average. 
+```{r,Aggregate}
+aggregate(train[,"Weekly_Sales"], by=train[,c("Store"), drop=FALSE], mean)
+
+aggregate(train[,"Weekly_Sales"], by=train[,c("Type"), drop=FALSE], mean)
+
+aggregate(train[,"Weekly_Sales"], by=train[,c("Type"), drop=FALSE], max)
+```
+
+With this initial information, we wanted to dig a little deeper and that is why we decided that graphic models will help us to find the interaction between each of the variables with Weekly Sales. Our goal with this exploration was to find correlation, patterns or any other insight that revealed more information between diving into our predictive model. 
+
+```{r}
+#Subset our data into train and test 
+
+index <- createDataPartition(train$Weekly_Sales,list = FALSE,p=0.8)
+train.train <-train[index,]
+train.test <- train[-index,]
+
+```
+
+```{r,echo=FALSE}
+ggplot(train.train,aes(x=CPI,y=Weekly_Sales)) + geom_point(aes(color=train.train$Type)) + geom_smooth() + scale_x_continuous(name="Consumer Price Index") + scale_y_continuous(name="Weekly Sales") + scale_color_discrete(name="Type")
+
+ggplot(train.train,aes(x=Unemployment,y=Weekly_Sales)) + geom_point(aes(color=train.train$Type)) + geom_smooth()  + scale_x_continuous(name="Unemployment") + scale_y_continuous(name="Weekly Sales") + scale_color_discrete(name="Type")
+
+ggplot(train.train,aes(x=Temperature,y=Weekly_Sales)) + geom_point(aes(color=train.train$Type)) + geom_smooth()  + scale_x_continuous(name="Temperature") + scale_y_continuous(name="Weekly Sales") + scale_color_discrete(name="Type")
+```
+
+
+In the previous graphs one can see that there is no clear correlation between Weekly Sales and Unemployment or Temperature. A clearer correlation is visible between CPI and Weekly Sales.
+However what is clear from this analysis is that Type A stores have more sales than any other type.  
+
+We also want to analyze what is the effect of the MarkDowns on the weekly sales of the company
+after analyzing the graphs we decided to show the one that had more impact. However, as one can see the MarkDowns don't show an immense correlation with Sales.
+```{r echo=FALSE, warning=FALSE}
+ggplot(train.train,aes(x=MarkDown4,y=Weekly_Sales)) + geom_point(aes(color=train.train$Type)) + geom_smooth()  + scale_x_continuous(name="MarkDown4") + scale_y_continuous(name="Weekly Sales") + scale_color_discrete(name="Type")
+```
+
+
+Plot Store sales divided by Type of Store, in the following plot we selected Type A stores
+```{r}
+A_stores <- train.train %>% filter(Type=='A')
+ggplot(A_stores,aes(x=CPI,y=Weekly_Sales)) + geom_point(aes(color=A_stores$IsHoliday)) + geom_smooth()#Sales vary depending on the weeknum we are in
+```
+Now we want to partition the Weekly Sales based on a store, from our analysis we saw that Store 20 is the one with the most sales. We will analyze this stores' results
+```{r,eval=FALSE}
+store_graph <- train.train %>% filter(Store == 20)
+ggplot(store_graph,aes(x=CPI,y=Weekly_Sales)) + geom_point(aes(color=store_graph$IsHoliday)) + geom_smooth()
+```
+Finally, look for a correlation matrix between all of our numerical features.  
+
+```{r warning=FALSE}
+corrplot.mixed(cor(train.train[,c(-1,-2,-4,-5,-17)]), lower = "ellipse",upper = "number",use="pairwise.complete.obs")
+```
+#Modelling
+Since we saw that the Store type is very important to predict the Weekly Sales of a given store, we will run a Decision Tree model to predict what Type a Store should be based on the 
+different features that we have on our model.  
+**Decision Tree**
+  
+```{r}
+#Using a decision tree we will like to predict the Type of a store based on all the other parameters
+train.rpart <-rpart(Type ~ Weekly_Sales+Size, data=train.train, control=rpart.control(minsplit=1,cp=0.05))
+summary(train.rpart)
+fancyRpartPlot(train.rpart)
+dim(train.train)
+```
+Now we will also like to form a Decision Tree for predicting the Rank that each store lies
+with respect to their sales. We want to look at the other features in order to predict what range of sales a store will have in the future taking into account anything but previous sales. 
+
+```{r,eval=FALSE,Rank}
+rank.rpart <- rpart(Rank~ Weekly_Sales+Type,data=train.train)
+fancyRpartPlot(rank.rpart)
+#summary(rank.rpart)
+```
+
+**Linear Regression**
+  We would also like to create a linear model to find a specific value for Weekly Sales
+that we want to predict. This line of best fit is intended to approximate further data points based on the line that we find in our training data. 
+```{r}
+# Fitting the model with confidence interval of 95%
+fit <- lm(Weekly_Sales ~.-Type-CPI, data=train.train)
+predict_fit_confidence <- predict(fit, newdata=train.test, interval="confidence", level=0.95)
+summary(fit)
+```
+```{r}
+# Predicting the linear regression model for Weekly_Sales
+set.seed(1)
+Model <- lm(Weekly_Sales ~.-Type-CPI, data=train.train)
+predict_weeklysales <- predict(Model, newdata=train.test)
+summary(Model)
+```
+From the above linear model, we can see that the linear regression model for weekly sales is
+
+Weekly_sales= -1.322e+06 + (Store2 * -8.116e+03) + (Store3 * -8.934e+05) + (Store4 * 1.190e+05) + (Store5 * -9.892e+05) + (Store6 * -2.299e+04) + (Store7 * -7.390e+05) + (Store8 * -4.537e+05) + (Store9 * -7.660e+05) + (Store10 * -1.407e+04) +  (Store11 * -1.536e+05) + (Store12 * -3.912e+05) + (Store13 * 5.048e+04) + (Store14 * 1.075+05) + (Store15 * -6.784e+05) +  (Store16 * -8.039e+05) +  (Store17 * -4.757e+05) +  (Store18 * -3.903e+05) +  (Store19 * -8.081e+04) +  (Store20 * 1.273e+05) + (Store21 * -5.520e+05) +(Store22 * -4.341e+05) +  (Store23 * -1.666e+05) +  (Store24 * -1.547e+05) +  (Store25 * -6.037e+05) +  (Store26 * -4.491e+05) +  (Store27 * 2.724e+03) +  (Store28 * -1.408e+05) +(Store29 * -7.446e+05) +  (Store30 * -8.547e+05) + (Store31 * -1.145e+05) + (Store32 * -3.301e+05) +  (Store33 * -1.015e+06) +  (Store34 * -4.482e+05) +  (Store35 * -4.313e+05) +  (Store36 * -9.190e+05) + (Store37 * -7.735e+05) +  (Store38 * -8.556e+05) + (Store39 * -8.724e+04) + (Store40 * -4.789e+05) + (Store41 * -2.490e+05) + (Store42 * -7.261e+05) + (Store43 * -6.385e+05) + (Store44 * -1.002e+06) + (Store45 * -5.154e+05) +  (Date * -3.784e+00) + (IsHolidayTRUE * 1.838e+04) + (WeekNum * 1.294e+03) + (Temperature * -3.888e+02) + (Fuel_Price * -7.942e+03) + (MarkDown1 * 8.325e-01) + (MarkDown2 * -8.128e-01) +  (MarkDown3 * 2.903e+00) + (MarkDown4 * -4.926e-01) + (MarkDown5 * 1.776e+00) + (Unemployment * -9.079e+03) + (RankB * 1.973e+05) +  (RankC * 5.972e+05) +  (RankD * 1.231e+06) + (RankE * 2.177e+06) 
+
+#Linear Regression Model Evaluation and Results
+* From the model summary, the model p value and predictor’s p value are less than the significance level.
+So we have a statistically significant model.
+* Also, the R-Squared and Adj R-Squared are comparative to the original model built on full data. R-Squared and Adj R-Squared values are approximately 97% indicating a good prediction model.
+
+```{r}
+# Prediction Accuracy Measures for Linear Regression Model 
+# 1. Correlation accuracy
+actuals_preds <- data.frame(cbind(actuals=train.test$Weekly_Sales, predicteds=predict_weeklysales))  # make actuals_predicteds dataframe.
+correlation_accuracy <- cor(actuals_preds)  
+correlation_accuracy
+head(actuals_preds)
+```
+Here we can see that correlation between the actuals and predicteds values is high, indicating a good linear prediction model.
+```{r}
+# 2. Min-Max Accuracy Calculation
+min_max_accuracy <- mean(apply(actuals_preds, 1, min) / apply(actuals_preds, 1, max))  
+min_max_accuracy
+```
+The Min-Max Accuracy is high (93.23%), indicating a good linear prediction model.
+
+```{r warning=FALSE}
+# 3. MAE (Mean Absolute Error) Calculation
+mae <- mean(abs(actuals_preds$predicteds - actuals_preds$actuals))
+mae
+```
+The value of MAE is 69846.7.
+```{r warning=FALSE}
+# sqrt(mean(error^2))
+# 4. RMSE (Root Mean Square Error) Calculation
+rmse <- sqrt(mean((actuals_preds$predicteds - actuals_preds$actuals)^2))
+rmse
+```
+The value of RMSE is 97003.42.
+```{r}
+# 5. MAPE (Mean Absolute Percentage Error) Calculation
+mape <- mean(abs((actuals_preds$predicteds - actuals_preds$actuals))/actuals_preds$actuals)
+mape
+```
+MAPE is low(approximately 7%), indicating a good linear prediction model.
+```{r warning=FALSE}
+# 6. R-squared Calculation
+library(caret)
+predictions <- predict( Model, train.test)
+R2(predictions, train.test$Weekly_Sales)
+
+```
+R-Squared value is high(approximately 97%), indicating a good linear prediction model.
+
+#Model Evaluation and Results
+First we will evaluate the result of our Type prediction Model in order to have a clearer
+picture of its accuracy with unseen data.
+```{r}
+prediction <- predict(train.rpart,train.test, type="class") # prob
+train.test$Prediction <- prediction
+#Find the percentage accuracy of our model
+accur_table <- train.test %>% select(Type,Prediction) 
+bool_vector <- accur_table$Type == accur_table$Prediction
+length(which(bool_vector)) / length(bool_vector)
+```
+We can see that the accuracy is a high 95%, so we can conclude that a Decision Tree is 
+a very powerful technique for this data set. Since the Type of the store is really significant 
+as we saw in our exploration. This result can help the company categorize new stores and therefore predict how much they should sell based on the Type of store they are grouped into. 
+
+Second, we evaluate the accuracy of our Rank prediction. This will help us to know within which range a certain store should sell in a given week of the year.
+```{r,eval=FALSE}
+#Evaluate Results of the Model 
+prediction_rank <- predict(rank.rpart,train.test, type="class")
+train.test$RankPred <- prediction_rank
+accuracy_test <- train.test %>% select(Rank,RankPred)
+values <- accuracy_test$Rank == accuracy_test$RankPred
+length(which(values)) / length(values)
+```
+We can see that the accuracy is a high 99%.
+
+```{r warning=FALSE}
+#rank.rpart$cptable
+# ROC curve for Rank
+library(pROC)
+predprobs <- predict(rank.rpart,train.test, type="prob")
+par(mfrow=c(2,3))
+# ROC for Rank A
+plot(roc(train.test$RankPred,predprobs[,1]),main="ROC for Rank A")
+# ROC for Rank B
+plot(roc(train.test$RankPred,predprobs[,2]),main="ROC for Rank B")
+# ROC for Rank C
+plot(roc(train.test$RankPred,predprobs[,3]),main="ROC for Rank C")
+# ROC for Rank D
+plot(roc(train.test$RankPred,predprobs[,4]),main="ROC for Rank D")
+# ROC for Rank E
+plot(roc(train.test$RankPred,predprobs[,5]),main="ROC for Rank E")
+```
+The plots above represent the ROC curve for the 5 Ranks.
+```{r}
+#Decision Tree Confusion Matrix for Rank
+conf <- table(actualclass=train.test$RankPred,predictedclass=train.test$Rank)
+confusionMatrix(conf)
+```
+The Confusion matrix for Rank shows a high accuracy of 99.53%, indicating that decision tree is a good model. 
+P value(2.2e-16) is less than the significance level. So we have a statistically significant model.
+```{r warning=FALSE}
+
+#train.rpart$cptable
+# ROC curve for Rank Type
+library(pROC)
+predprobs2 <- predict(train.rpart,train.train, type="prob")
+par(mfrow=c(1,3))
+# ROC for Type A
+plot(roc(train.train$Type,predprobs2[,1]),main="ROC for Type A")
+# ROC for Type B
+plot(roc(train.train$Type,predprobs2[,2]),main="ROC for Type B")
+# ROC for Type C
+plot(roc(train.train$Type,predprobs2[,3]),main="ROC for Type C")
+```
+The plots above represent the ROC curve for the 3 Types of store.
+```{r}
+#Decision Tree Confusion Matrix for Type
+conf2 <- table(actualclass=train.test$Prediction,predictedclass=train.test$Type)
+confusionMatrix(conf2)
+
+```
